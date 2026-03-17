@@ -161,6 +161,60 @@ document.body.appendChild(axisLabel);
 
 let selectedAxis = 1; // 0=X, 1=Y, 2=Z — start with Y
 
+// --- Face arrow (separate from vertex arrow) ---
+let faceArrow = null;
+const faceLabel = document.createElement("div");
+faceLabel.style.cssText =
+  "position:fixed;padding:1px 5px;border-radius:3px;font:bold 10px monospace;" +
+  "color:#fff;pointer-events:none;display:none;z-index:10;";
+document.body.appendChild(faceLabel);
+
+function showFaceArrow(worldPos, dir, axisIdx, growFactor) {
+  if (faceArrow) { scene.remove(faceArrow); faceArrow.dispose(); faceArrow = null; }
+  if (growFactor <= 0.01) { faceLabel.style.display = "none"; return; }
+
+  const camDist = camera.position.distanceTo(worldPos);
+  const distScale = camDist / arrowRefDist;
+  const length = arrowBaseLength * distScale * growFactor;
+  const headLength = Math.min(arrowBaseHeadLength * distScale * growFactor, length * 0.6);
+  const headWidth = arrowBaseHeadWidth * distScale * growFactor;
+
+  faceArrow = new THREE.ArrowHelper(dir, worldPos, length, axisColors[axisIdx], headLength, headWidth);
+  faceArrow.renderOrder = 2;
+  faceArrow.line.material.depthTest = false;
+  faceArrow.cone.material.depthTest = false;
+  scene.add(faceArrow);
+
+  if (growFactor > 0.6) {
+    const endPos = worldPos.clone().addScaledVector(dir, length + 0.05 * distScale);
+    const s = endPos.project(camera);
+    faceLabel.style.left = ((s.x * 0.5 + 0.5) * window.innerWidth + 4) + "px";
+    faceLabel.style.top = ((-s.y * 0.5 + 0.5) * window.innerHeight - 10) + "px";
+    faceLabel.style.background = "#" + axisColors[axisIdx].toString(16).padStart(6, "0");
+    faceLabel.textContent = axisNames[axisIdx];
+    faceLabel.style.display = "block";
+  } else {
+    faceLabel.style.display = "none";
+  }
+}
+
+function hideFaceArrow() {
+  if (faceArrow) { scene.remove(faceArrow); faceArrow.dispose(); faceArrow = null; }
+  faceLabel.style.display = "none";
+}
+
+// Face hover state — updated only on mousemove
+const faceRaycaster = new THREE.Raycaster();
+let faceHoverAxis = -1;
+let faceHoverSign = 0;
+let faceHoverCenter = new THREE.Vector3();
+let faceHoverNormal = new THREE.Vector3();
+let faceHoverScreenDist = Infinity;
+let mouseOnBlock = false;
+let faceGrow = 0;
+let faceGrowTarget = 0;
+const faceProximityThreshold = 80;
+
 // --- Dimension input overlay ---
 const dimInput = document.createElement("input");
 dimInput.type = "text";
@@ -232,6 +286,35 @@ const tempVec = new THREE.Vector3();
 function updateVertexHover(e) {
   mouseScreen.x = e.clientX;
   mouseScreen.y = e.clientY;
+
+  // Face raycast (only here, on mousemove — not every frame)
+  const ndcX = (e.clientX / window.innerWidth) * 2 - 1;
+  const ndcY = -(e.clientY / window.innerHeight) * 2 + 1;
+  faceRaycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), camera);
+  const hits = faceRaycaster.intersectObject(blockMesh);
+  if (hits.length > 0) {
+    mouseOnBlock = true;
+    const normal = hits[0].face.normal.clone().transformDirection(blockMesh.matrixWorld).normalize();
+    const abs = [Math.abs(normal.x), Math.abs(normal.y), Math.abs(normal.z)];
+    let axis = 0;
+    if (abs[1] > abs[0] && abs[1] > abs[2]) axis = 1;
+    else if (abs[2] > abs[0] && abs[2] > abs[1]) axis = 2;
+    const sign = normal.getComponent(axis) > 0 ? 1 : -1;
+
+    faceHoverAxis = axis;
+    faceHoverSign = sign;
+    faceHoverNormal.set(0, 0, 0).setComponent(axis, sign);
+    faceHoverCenter.copy(blockCenter);
+    faceHoverCenter.setComponent(axis, blockCenter.getComponent(axis) + sign * blockSize.getComponent(axis) * 0.5);
+
+    const fc = faceHoverCenter.clone().project(camera);
+    const sx = (fc.x * 0.5 + 0.5) * window.innerWidth;
+    const sy = (-fc.y * 0.5 + 0.5) * window.innerHeight;
+    faceHoverScreenDist = Math.sqrt((mouseScreen.x - sx) ** 2 + (mouseScreen.y - sy) ** 2);
+  } else {
+    mouseOnBlock = false;
+    faceHoverScreenDist = Infinity;
+  }
 }
 
 function isVertexVisible(worldPos) {
@@ -329,6 +412,24 @@ function animateVertices() {
     if (vd.currentGrow > 0.3) anyCursorClose = true;
   } else {
     hideAxisArrow();
+  }
+
+  // --- Face arrow (only when no vertex is active) ---
+  const vertexActive = isDragging || (activeVertexIdx >= 0 && vertexData[activeVertexIdx].currentGrow > 0.01);
+  if (!vertexActive && mouseOnBlock) {
+    const prox = Math.max(0, 1 - faceHoverScreenDist / faceProximityThreshold);
+    faceGrowTarget = prox * prox;
+  } else {
+    faceGrowTarget = 0;
+  }
+  faceGrow += (faceGrowTarget - faceGrow) * 0.15;
+  if (faceGrow < 0.005) faceGrow = 0;
+
+  if (faceGrow > 0.01) {
+    showFaceArrow(faceHoverCenter, faceHoverNormal, faceHoverAxis, faceGrow);
+    if (faceGrow > 0.3) anyCursorClose = true;
+  } else {
+    hideFaceArrow();
   }
 
   renderer.domElement.style.cursor =
