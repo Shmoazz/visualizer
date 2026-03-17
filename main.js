@@ -161,6 +161,55 @@ document.body.appendChild(axisLabel);
 
 let selectedAxis = 1; // 0=X, 1=Y, 2=Z — start with Y
 
+// --- Face arrow indicator (separate from vertex arrow) ---
+let faceArrow = null;
+const faceLabel = document.createElement("div");
+faceLabel.style.cssText =
+  "position:fixed;padding:1px 5px;border-radius:3px;font:bold 10px monospace;" +
+  "color:#fff;pointer-events:none;display:none;z-index:10;";
+document.body.appendChild(faceLabel);
+
+const faceRaycaster = new THREE.Raycaster();
+const faceNDC = new THREE.Vector2();
+let faceHover = { axis: -1, sign: 0, center: new THREE.Vector3(), normal: new THREE.Vector3(), currentGrow: 0, targetGrow: 0 };
+const faceProximityThreshold = 80;
+
+function showFaceArrow(worldPos, normal, axisIdx, growFactor) {
+  if (faceArrow) { scene.remove(faceArrow); faceArrow.dispose(); faceArrow = null; }
+  if (growFactor <= 0.01) return;
+
+  const camDist = camera.position.distanceTo(worldPos);
+  const distScale = camDist / arrowRefDist;
+  const length = arrowBaseLength * distScale * growFactor;
+  const headLength = Math.min(arrowBaseHeadLength * distScale * growFactor, length * 0.6);
+  const headWidth = arrowBaseHeadWidth * distScale * growFactor;
+
+  faceArrow = new THREE.ArrowHelper(normal, worldPos, length, axisColors[axisIdx], headLength, headWidth);
+  faceArrow.renderOrder = 2;
+  faceArrow.line.material.depthTest = false;
+  faceArrow.cone.material.depthTest = false;
+  scene.add(faceArrow);
+
+  if (growFactor > 0.6) {
+    const endPos = worldPos.clone().addScaledVector(normal, length + 0.05 * distScale);
+    const endScreen = endPos.clone().project(camera);
+    const sx = (endScreen.x * 0.5 + 0.5) * window.innerWidth;
+    const sy = (-endScreen.y * 0.5 + 0.5) * window.innerHeight;
+    faceLabel.style.left = sx + 4 + "px";
+    faceLabel.style.top = sy - 10 + "px";
+    faceLabel.style.background = "#" + axisColors[axisIdx].toString(16).padStart(6, "0");
+    faceLabel.textContent = axisNames[axisIdx];
+    faceLabel.style.display = "block";
+  } else {
+    faceLabel.style.display = "none";
+  }
+}
+
+function hideFaceArrow() {
+  if (faceArrow) { scene.remove(faceArrow); faceArrow.dispose(); faceArrow = null; }
+  faceLabel.style.display = "none";
+}
+
 // --- Dimension input overlay ---
 const dimInput = document.createElement("input");
 dimInput.type = "text";
@@ -318,6 +367,7 @@ function animateVertices() {
     if (vd.currentGrow < 0.005) vd.currentGrow = 0;
   }
 
+  // --- Vertex arrow ---
   if (isDragging) {
     const vertWorldPos = getVertexWorldPos(dragCornerSign);
     showAxisArrow(vertWorldPos, dragCornerSign, 1);
@@ -329,6 +379,56 @@ function animateVertices() {
     if (vd.currentGrow > 0.3) anyCursorClose = true;
   } else {
     hideAxisArrow();
+  }
+
+  // --- Face arrow (only when no vertex is active) ---
+  const vertexActive = isDragging || (activeVertexIdx >= 0 && vertexData[activeVertexIdx].currentGrow > 0.01);
+
+  if (!vertexActive && !isDragging) {
+    faceNDC.x = (mouseScreen.x / window.innerWidth) * 2 - 1;
+    faceNDC.y = -(mouseScreen.y / window.innerHeight) * 2 + 1;
+    faceRaycaster.setFromCamera(faceNDC, camera);
+    const hits = faceRaycaster.intersectObject(blockMesh);
+
+    if (hits.length > 0) {
+      const hit = hits[0];
+      const normal = hit.face.normal.clone().transformDirection(blockMesh.matrixWorld).normalize();
+      const abs = [Math.abs(normal.x), Math.abs(normal.y), Math.abs(normal.z)];
+      let axis = 0;
+      if (abs[1] > abs[0] && abs[1] > abs[2]) axis = 1;
+      else if (abs[2] > abs[0] && abs[2] > abs[1]) axis = 2;
+      const sign = normal.getComponent(axis) > 0 ? 1 : -1;
+
+      const fc = blockCenter.clone();
+      fc.setComponent(axis, blockCenter.getComponent(axis) + sign * blockSize.getComponent(axis) * 0.5);
+
+      // Screen distance to face center for grow
+      const fcScreen = fc.clone().project(camera);
+      const sx = (fcScreen.x * 0.5 + 0.5) * window.innerWidth;
+      const sy = (-fcScreen.y * 0.5 + 0.5) * window.innerHeight;
+      const dist = Math.sqrt((mouseScreen.x - sx) ** 2 + (mouseScreen.y - sy) ** 2);
+      const proximity = Math.max(0, 1 - dist / faceProximityThreshold);
+
+      faceHover.axis = axis;
+      faceHover.sign = sign;
+      faceHover.center.copy(fc);
+      faceHover.normal.set(0, 0, 0).setComponent(axis, sign);
+      faceHover.targetGrow = proximity * proximity;
+    } else {
+      faceHover.targetGrow = 0;
+    }
+  } else {
+    faceHover.targetGrow = 0;
+  }
+
+  faceHover.currentGrow += (faceHover.targetGrow - faceHover.currentGrow) * 0.15;
+  if (faceHover.currentGrow < 0.005) faceHover.currentGrow = 0;
+
+  if (faceHover.currentGrow > 0.01) {
+    showFaceArrow(faceHover.center, faceHover.normal, faceHover.axis, faceHover.currentGrow);
+    if (faceHover.currentGrow > 0.3) anyCursorClose = true;
+  } else {
+    hideFaceArrow();
   }
 
   renderer.domElement.style.cursor =
