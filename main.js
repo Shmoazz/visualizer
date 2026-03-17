@@ -19,64 +19,54 @@ renderer.setPixelRatio(window.devicePixelRatio);
 document.body.appendChild(renderer.domElement);
 
 // --- Lighting ---
-const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
-scene.add(ambientLight);
+scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+dirLight.position.set(5, 10, 7);
+scene.add(dirLight);
 
-const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
-directionalLight.position.set(5, 10, 7);
-scene.add(directionalLight);
-
-// --- Grid helper ---
-const grid = new THREE.GridHelper(20, 20, 0x555555, 0x444444);
-scene.add(grid);
+// --- Grid ---
+scene.add(new THREE.GridHelper(20, 20, 0x555555, 0x444444));
 
 // --- Block state ---
-const blockSize = new THREE.Vector3(1, 1, 1); // meters
+const blockSize = new THREE.Vector3(1, 1, 1);
 const blockCenter = new THREE.Vector3(0, 0.5, 0);
 const MIN_SIZE = 0.1;
 
-let blockMesh, blockWireframe;
+let blockMesh;
 let vertexData = [];
 
 function buildBlock() {
   if (blockMesh) scene.remove(blockMesh);
 
   const geo = new THREE.BoxGeometry(blockSize.x, blockSize.y, blockSize.z);
-  const mat = new THREE.MeshStandardMaterial({ color: 0x4a90d9 });
-  blockMesh = new THREE.Mesh(geo, mat);
+  blockMesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: 0x4a90d9 }));
   blockMesh.position.copy(blockCenter);
   scene.add(blockMesh);
 
-  const edgesGeo = new THREE.EdgesGeometry(geo);
-  const lineMat = new THREE.LineBasicMaterial({ color: 0x222222 });
-  blockWireframe = new THREE.LineSegments(edgesGeo, lineMat);
-  blockMesh.add(blockWireframe);
+  blockMesh.add(new THREE.LineSegments(
+    new THREE.EdgesGeometry(geo),
+    new THREE.LineBasicMaterial({ color: 0x222222 })
+  ));
 
   rebuildVertexData(geo);
 }
 
-const proximityThreshold = 40;
-
 function rebuildVertexData(geo) {
   vertexData = [];
   const posAttr = geo.getAttribute("position");
-  const uniqueVerts = new Map();
+  const seen = new Map();
   for (let i = 0; i < posAttr.count; i++) {
-    const x = posAttr.getX(i);
-    const y = posAttr.getY(i);
-    const z = posAttr.getZ(i);
+    const x = posAttr.getX(i), y = posAttr.getY(i), z = posAttr.getZ(i);
     const key = `${x.toFixed(4)},${y.toFixed(4)},${z.toFixed(4)}`;
-    if (!uniqueVerts.has(key)) {
-      uniqueVerts.set(key, new THREE.Vector3(x, y, z));
+    if (!seen.has(key)) {
+      seen.set(key, new THREE.Vector3(x, y, z));
     }
   }
-  for (const pos of uniqueVerts.values()) {
+  for (const pos of seen.values()) {
     vertexData.push({
       localPos: pos.clone(),
       cornerSign: new THREE.Vector3(
-        Math.sign(pos.x) || 1,
-        Math.sign(pos.y) || 1,
-        Math.sign(pos.z) || 1
+        Math.sign(pos.x) || 1, Math.sign(pos.y) || 1, Math.sign(pos.z) || 1
       ),
       currentGrow: 0,
       targetGrow: 0,
@@ -86,82 +76,120 @@ function rebuildVertexData(geo) {
 
 buildBlock();
 
-// --- Axis arrow indicator ---
-const axisColors = [0xff3333, 0x33ff55, 0x3399ff]; // X=red, Y=green, Z=blue
+// --- Shared constants ---
+const axisColors = [0xff3333, 0x33ff55, 0x3399ff];
 const axisNames = ["X", "Y", "Z"];
 const arrowRefDist = 7;
 const arrowBaseLength = 0.5;
 const arrowBaseHeadLength = 0.18;
 const arrowBaseHeadWidth = 0.1;
+const proximityThreshold = 40;
+const faceProximityThreshold = 80;
 
-let axisArrow = null;
+// --- Reusable arrow pool (no more alloc/dispose every frame) ---
+// Each arrow is a group with a CylinderGeometry shaft + ConeGeometry head, reused.
+function makeReusableArrow() {
+  const shaftGeo = new THREE.CylinderGeometry(0.015, 0.015, 1, 8);
+  shaftGeo.translate(0, 0.5, 0);
+  const shaftMat = new THREE.MeshBasicMaterial({ depthTest: false });
+  const shaft = new THREE.Mesh(shaftGeo, shaftMat);
 
-function showAxisArrow(worldPos, cornerSign, growFactor) {
-  if (axisArrow) {
-    scene.remove(axisArrow);
-    axisArrow.dispose();
-    axisArrow = null;
+  const headGeo = new THREE.ConeGeometry(0.05, 0.15, 8);
+  headGeo.translate(0, 0.075, 0);
+  const headMat = new THREE.MeshBasicMaterial({ depthTest: false });
+  const head = new THREE.Mesh(headGeo, headMat);
+
+  const group = new THREE.Group();
+  group.add(shaft);
+  group.add(head);
+  group.renderOrder = 2;
+  group.visible = false;
+  scene.add(group);
+
+  return { group, shaft, head, shaftMat, headMat };
+}
+
+const vertexArrow = makeReusableArrow();
+const faceArrow = makeReusableArrow();
+
+function updateArrow(arrow, worldPos, dir, axisIdx, growFactor) {
+  if (growFactor <= 0.01) {
+    arrow.group.visible = false;
+    return;
   }
-
-  if (growFactor <= 0.01) return;
 
   const camDist = camera.position.distanceTo(worldPos);
   const distScale = camDist / arrowRefDist;
   const length = arrowBaseLength * distScale * growFactor;
-  const headLength = Math.min(arrowBaseHeadLength * distScale * growFactor, length * 0.6);
-  const headWidth = arrowBaseHeadWidth * distScale * growFactor;
+  const headLen = Math.min(arrowBaseHeadLength * distScale * growFactor, length * 0.6);
+  const headW = arrowBaseHeadWidth * distScale * growFactor;
+  const shaftLen = length - headLen;
 
-  const dir = new THREE.Vector3(0, 0, 0);
-  dir.setComponent(selectedAxis, cornerSign.getComponent(selectedAxis));
-  dir.normalize();
+  const color = axisColors[axisIdx];
+  arrow.shaftMat.color.set(color);
+  arrow.headMat.color.set(color);
 
-  axisArrow = new THREE.ArrowHelper(
-    dir,
-    worldPos,
-    length,
-    axisColors[selectedAxis],
-    headLength,
-    headWidth
-  );
-  axisArrow.renderOrder = 2;
-  axisArrow.line.material.depthTest = false;
-  axisArrow.cone.material.depthTest = false;
-  scene.add(axisArrow);
+  // Scale shaft: height = shaftLen, width = proportional
+  const shaftWidth = 0.015 * distScale * Math.max(growFactor, 0.3);
+  arrow.shaft.scale.set(shaftWidth / 0.015, shaftLen, shaftWidth / 0.015);
 
+  // Position head at end of shaft
+  arrow.head.position.set(0, shaftLen, 0);
+  arrow.head.scale.set(headW / 0.05, headLen / 0.15, headW / 0.05);
+
+  // Orient group to point along dir
+  arrow.group.position.copy(worldPos);
+  const up = new THREE.Vector3(0, 1, 0);
+  if (Math.abs(dir.y) > 0.999) {
+    up.set(1, 0, 0);
+  }
+  const quat = new THREE.Quaternion();
+  const mat4 = new THREE.Matrix4();
+  mat4.lookAt(new THREE.Vector3(), dir, up);
+  // lookAt gives -Z forward, but our arrow points +Y, so rotate -90 around X
+  const rotFix = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI / 2);
+  quat.setFromRotationMatrix(mat4).multiply(rotFix);
+  arrow.group.quaternion.copy(quat);
+
+  arrow.group.visible = true;
+}
+
+function hideArrow(arrow) {
+  arrow.group.visible = false;
+}
+
+// --- Labels ---
+function makeLabel() {
+  const el = document.createElement("div");
+  el.style.cssText =
+    "position:fixed;padding:1px 5px;border-radius:3px;font:bold 10px monospace;" +
+    "color:#fff;pointer-events:none;display:none;z-index:10;";
+  document.body.appendChild(el);
+  return el;
+}
+const vertexLabel = makeLabel();
+const faceLabel = makeLabel();
+
+function updateLabel(label, worldPos, dir, axisIdx, growFactor) {
   if (growFactor > 0.6) {
+    const camDist = camera.position.distanceTo(worldPos);
+    const distScale = camDist / arrowRefDist;
+    const length = arrowBaseLength * distScale * growFactor;
     const endPos = worldPos.clone().addScaledVector(dir, length + 0.05 * distScale);
-    const endScreen = endPos.clone().project(camera);
-    const sx = (endScreen.x * 0.5 + 0.5) * window.innerWidth;
-    const sy = (-endScreen.y * 0.5 + 0.5) * window.innerHeight;
-    axisLabel.style.left = sx + 4 + "px";
-    axisLabel.style.top = sy - 10 + "px";
-    axisLabel.style.background = "#" + axisColors[selectedAxis].toString(16).padStart(6, "0");
-    axisLabel.textContent = axisNames[selectedAxis];
-    axisLabel.style.display = "block";
+    const s = endPos.project(camera);
+    label.style.left = ((s.x * 0.5 + 0.5) * window.innerWidth + 4) + "px";
+    label.style.top = ((-s.y * 0.5 + 0.5) * window.innerHeight - 10) + "px";
+    label.style.background = "#" + axisColors[axisIdx].toString(16).padStart(6, "0");
+    label.textContent = axisNames[axisIdx];
+    label.style.display = "block";
   } else {
-    axisLabel.style.display = "none";
+    label.style.display = "none";
   }
 }
 
-function hideAxisArrow() {
-  if (axisArrow) {
-    scene.remove(axisArrow);
-    axisArrow.dispose();
-    axisArrow = null;
-  }
-  axisLabel.style.display = "none";
-}
+let selectedAxis = 1;
 
-// Axis label overlay
-const axisLabel = document.createElement("div");
-axisLabel.style.cssText =
-  "position:fixed;padding:1px 5px;border-radius:3px;font:bold 10px monospace;" +
-  "color:#fff;pointer-events:none;display:none;z-index:10;";
-document.body.appendChild(axisLabel);
-
-let selectedAxis = 1; // 0=X, 1=Y, 2=Z — start with Y
-
-// --- Dimension input overlay ---
+// --- Dimension input ---
 const dimInput = document.createElement("input");
 dimInput.type = "text";
 dimInput.style.cssText =
@@ -177,8 +205,7 @@ function showDimInput(screenX, screenY, currentValue, cornerSign) {
   dimInput.value = currentValue.toFixed(2);
   dimInput.style.left = screenX - 35 + "px";
   dimInput.style.top = screenY + 16 + "px";
-  dimInput.style.borderColor =
-    "#" + axisColors[selectedAxis].toString(16).padStart(6, "0");
+  dimInput.style.borderColor = "#" + axisColors[selectedAxis].toString(16).padStart(6, "0");
   dimInput.style.display = "block";
   dimInput.select();
   dimInput.focus();
@@ -194,10 +221,8 @@ function commitDimInput() {
     const sizeChange = val - oldSize;
     blockSize.setComponent(selectedAxis, val);
     const sign = dimInputCornerSign.getComponent(selectedAxis);
-    blockCenter.setComponent(
-      selectedAxis,
-      blockCenter.getComponent(selectedAxis) + sizeChange * sign * 0.5
-    );
+    blockCenter.setComponent(selectedAxis,
+      blockCenter.getComponent(selectedAxis) + sizeChange * sign * 0.5);
     buildBlock();
   }
   dismissDimInput();
@@ -216,7 +241,7 @@ dimInput.addEventListener("keydown", (e) => {
 });
 dimInput.addEventListener("blur", () => commitDimInput());
 
-// --- Resize interaction state ---
+// --- Interaction state ---
 let activeVertexIdx = -1;
 let isDragging = false;
 let dragStartMouse = new THREE.Vector2();
@@ -224,15 +249,22 @@ let dragStartSize = new THREE.Vector3();
 let dragStartCenter = new THREE.Vector3();
 let dragCornerSign = new THREE.Vector3();
 
+// Face hover state (updated only on mousemove, not every frame)
+let faceHoverAxis = -1;
+let faceHoverSign = 0;
+let faceHoverCenter = new THREE.Vector3();
+let faceHoverNormal = new THREE.Vector3();
+let faceHoverScreenDist = Infinity;
+let mouseOnBlock = false;
+let faceGrow = 0;
+let faceGrowTarget = 0;
+
 // --- Mouse tracking ---
 const mouseScreen = new THREE.Vector2();
 const tempWorldPos = new THREE.Vector3();
 const tempVec = new THREE.Vector3();
-
-function updateVertexHover(e) {
-  mouseScreen.x = e.clientX;
-  mouseScreen.y = e.clientY;
-}
+const raycaster = new THREE.Raycaster();
+const mouseNDC = new THREE.Vector2();
 
 function isVertexVisible(worldPos) {
   const toCamera = tempVec.copy(camera.position).sub(blockMesh.position);
@@ -240,40 +272,23 @@ function isVertexVisible(worldPos) {
   const sx = Math.sign(cs.x) || 1;
   const sy = Math.sign(cs.y) || 1;
   const sz = Math.sign(cs.z) || 1;
-  return (
-    sx * toCamera.x > 0 ||
-    sy * toCamera.y > 0 ||
-    sz * toCamera.z > 0
-  );
+  return sx * toCamera.x > 0 || sy * toCamera.y > 0 || sz * toCamera.z > 0;
 }
 
 function getClosestVertex() {
-  let closestIdx = -1;
-  let closestDist = Infinity;
-
+  let closestIdx = -1, closestDist = Infinity;
   for (let i = 0; i < vertexData.length; i++) {
     const vd = vertexData[i];
     tempWorldPos.copy(vd.localPos);
     blockMesh.localToWorld(tempWorldPos);
     if (!isVertexVisible(tempWorldPos)) continue;
     tempWorldPos.project(camera);
-
-    const screenX = (tempWorldPos.x * 0.5 + 0.5) * window.innerWidth;
-    const screenY = (-tempWorldPos.y * 0.5 + 0.5) * window.innerHeight;
-    const dx = mouseScreen.x - screenX;
-    const dy = mouseScreen.y - screenY;
-    const dist = Math.sqrt(dx * dx + dy * dy);
-
-    if (dist < closestDist) {
-      closestDist = dist;
-      closestIdx = i;
-    }
+    const sx = (tempWorldPos.x * 0.5 + 0.5) * window.innerWidth;
+    const sy = (-tempWorldPos.y * 0.5 + 0.5) * window.innerHeight;
+    const dist = Math.hypot(mouseScreen.x - sx, mouseScreen.y - sy);
+    if (dist < closestDist) { closestDist = dist; closestIdx = i; }
   }
-
-  if (closestIdx >= 0 && closestDist < proximityThreshold) {
-    return closestIdx;
-  }
-  return -1;
+  return closestIdx >= 0 && closestDist < proximityThreshold ? closestIdx : -1;
 }
 
 function getVertexWorldPos(cornerSign) {
@@ -284,63 +299,123 @@ function getVertexWorldPos(cornerSign) {
   );
 }
 
-function animateVertices() {
+// Called ONLY on mousemove — does the raycast for face detection
+function updateHover(e) {
+  mouseScreen.x = e.clientX;
+  mouseScreen.y = e.clientY;
+  mouseNDC.x = (e.clientX / window.innerWidth) * 2 - 1;
+  mouseNDC.y = -(e.clientY / window.innerHeight) * 2 + 1;
+
+  // Face raycast (cheap — single box)
+  raycaster.setFromCamera(mouseNDC, camera);
+  const hits = raycaster.intersectObject(blockMesh);
+  if (hits.length > 0) {
+    mouseOnBlock = true;
+    const normal = hits[0].face.normal.clone().transformDirection(blockMesh.matrixWorld).normalize();
+    const abs = [Math.abs(normal.x), Math.abs(normal.y), Math.abs(normal.z)];
+    let axis = 0;
+    if (abs[1] > abs[0] && abs[1] > abs[2]) axis = 1;
+    else if (abs[2] > abs[0] && abs[2] > abs[1]) axis = 2;
+    const sign = normal.getComponent(axis) > 0 ? 1 : -1;
+
+    faceHoverAxis = axis;
+    faceHoverSign = sign;
+    faceHoverNormal.set(0, 0, 0).setComponent(axis, sign);
+    faceHoverCenter.copy(blockCenter);
+    faceHoverCenter.setComponent(axis, blockCenter.getComponent(axis) + sign * blockSize.getComponent(axis) * 0.5);
+
+    // Screen distance to face center
+    const fc = faceHoverCenter.clone().project(camera);
+    const sx = (fc.x * 0.5 + 0.5) * window.innerWidth;
+    const sy = (-fc.y * 0.5 + 0.5) * window.innerHeight;
+    faceHoverScreenDist = Math.hypot(mouseScreen.x - sx, mouseScreen.y - sy);
+  } else {
+    mouseOnBlock = false;
+    faceHoverScreenDist = Infinity;
+  }
+}
+
+// Called every frame — only does lerping, no raycasting or allocation
+function animateFrame() {
   if (!isDragging) {
     activeVertexIdx = getClosestVertex();
   }
 
   let anyCursorClose = false;
 
+  // Vertex grow targets
   for (let i = 0; i < vertexData.length; i++) {
     const vd = vertexData[i];
-    tempWorldPos.copy(vd.localPos);
-    blockMesh.localToWorld(tempWorldPos);
-
-    const visible = isVertexVisible(tempWorldPos);
-    tempWorldPos.project(camera);
-
-    const screenX = (tempWorldPos.x * 0.5 + 0.5) * window.innerWidth;
-    const screenY = (-tempWorldPos.y * 0.5 + 0.5) * window.innerHeight;
-    const dx = mouseScreen.x - screenX;
-    const dy = mouseScreen.y - screenY;
-    const dist = Math.sqrt(dx * dx + dy * dy);
-
-    if (visible && dist < proximityThreshold && i === activeVertexIdx) {
-      const proximity = 1 - dist / proximityThreshold;
-      vd.targetGrow = proximity * proximity;
-      if (proximity > 0.3) anyCursorClose = true;
+    if (i === activeVertexIdx) {
+      tempWorldPos.copy(vd.localPos);
+      blockMesh.localToWorld(tempWorldPos);
+      tempWorldPos.project(camera);
+      const sx = (tempWorldPos.x * 0.5 + 0.5) * window.innerWidth;
+      const sy = (-tempWorldPos.y * 0.5 + 0.5) * window.innerHeight;
+      const dist = Math.hypot(mouseScreen.x - sx, mouseScreen.y - sy);
+      const prox = 1 - dist / proximityThreshold;
+      vd.targetGrow = prox * prox;
+      if (prox > 0.3) anyCursorClose = true;
     } else {
       vd.targetGrow = 0;
     }
-
-    const lerp = 0.15;
-    vd.currentGrow += (vd.targetGrow - vd.currentGrow) * lerp;
+    vd.currentGrow += (vd.targetGrow - vd.currentGrow) * 0.15;
     if (vd.currentGrow < 0.005) vd.currentGrow = 0;
   }
 
+  const vertexActive = activeVertexIdx >= 0 && vertexData[activeVertexIdx].currentGrow > 0.01;
+
+  // Vertex arrow
   if (isDragging) {
-    const vertWorldPos = getVertexWorldPos(dragCornerSign);
-    showAxisArrow(vertWorldPos, dragCornerSign, 1);
-  } else if (activeVertexIdx >= 0 && vertexData[activeVertexIdx].currentGrow > 0.01) {
+    const wp = getVertexWorldPos(dragCornerSign);
+    const dir = new THREE.Vector3(0, 0, 0);
+    dir.setComponent(selectedAxis, dragCornerSign.getComponent(selectedAxis));
+    dir.normalize();
+    updateArrow(vertexArrow, wp, dir, selectedAxis, 1);
+    updateLabel(vertexLabel, wp, dir, selectedAxis, 1);
+  } else if (vertexActive) {
     const vd = vertexData[activeVertexIdx];
     tempWorldPos.copy(vd.localPos);
     blockMesh.localToWorld(tempWorldPos);
-    showAxisArrow(tempWorldPos, vd.cornerSign, vd.currentGrow);
-    if (vd.currentGrow > 0.3) anyCursorClose = true;
+    const dir = new THREE.Vector3(0, 0, 0);
+    dir.setComponent(selectedAxis, vd.cornerSign.getComponent(selectedAxis));
+    dir.normalize();
+    updateArrow(vertexArrow, tempWorldPos, dir, selectedAxis, vd.currentGrow);
+    updateLabel(vertexLabel, tempWorldPos, dir, selectedAxis, vd.currentGrow);
+    anyCursorClose = true;
   } else {
-    hideAxisArrow();
+    hideArrow(vertexArrow);
+    vertexLabel.style.display = "none";
+  }
+
+  // Face grow target (only when no vertex is active)
+  if (!vertexActive && !isDragging && mouseOnBlock) {
+    const prox = Math.max(0, 1 - faceHoverScreenDist / faceProximityThreshold);
+    faceGrowTarget = prox * prox;
+  } else {
+    faceGrowTarget = 0;
+  }
+  faceGrow += (faceGrowTarget - faceGrow) * 0.15;
+  if (faceGrow < 0.005) faceGrow = 0;
+
+  // Face arrow
+  if (faceGrow > 0.01) {
+    updateArrow(faceArrow, faceHoverCenter, faceHoverNormal, faceHoverAxis, faceGrow);
+    updateLabel(faceLabel, faceHoverCenter, faceHoverNormal, faceHoverAxis, faceGrow);
+    if (faceGrow > 0.3) anyCursorClose = true;
+  } else {
+    hideArrow(faceArrow);
+    faceLabel.style.display = "none";
   }
 
   renderer.domElement.style.cursor =
     isDragging ? "ew-resize" : anyCursorClose ? "pointer" : "default";
 }
 
-// --- Camera controls (custom middle-mouse) ---
+// --- Camera controls ---
 const spherical = new THREE.Spherical();
 const camTarget = new THREE.Vector3(0, 0, 0);
-
-const cOffset = new THREE.Vector3().copy(camera.position).sub(camTarget);
-spherical.setFromVector3(cOffset);
+spherical.setFromVector3(new THREE.Vector3().copy(camera.position).sub(camTarget));
 
 let isRotating = false;
 let isPanning = false;
@@ -367,42 +442,33 @@ function onMouseDown(e) {
 }
 
 function onMouseMove(e) {
-  updateVertexHover(e);
+  updateHover(e);
 
   if (isDragging) {
     const axisDir3D = new THREE.Vector3(0, 0, 0);
     axisDir3D.setComponent(selectedAxis, dragCornerSign.getComponent(selectedAxis));
 
-    const worldOrigin = dragStartCenter.clone();
-    const worldEnd = dragStartCenter.clone().add(axisDir3D);
-
     const tempCam = camera.clone();
     tempCam.updateMatrixWorld();
-    const screenOrigin = worldOrigin.clone().project(tempCam);
-    const screenEnd = worldEnd.clone().project(tempCam);
-
-    const axisDirScreen = new THREE.Vector2(
-      screenEnd.x - screenOrigin.x,
-      screenEnd.y - screenOrigin.y
-    ).normalize();
+    const so = dragStartCenter.clone().project(tempCam);
+    const se = dragStartCenter.clone().add(axisDir3D).project(tempCam);
+    const axisDirScreen = new THREE.Vector2(se.x - so.x, se.y - so.y).normalize();
 
     const mouseDelta = new THREE.Vector2(
       ((e.clientX - dragStartMouse.x) / window.innerWidth) * 2,
       (-(e.clientY - dragStartMouse.y) / window.innerHeight) * 2
     );
-
     const dragAmount = mouseDelta.dot(axisDirScreen) * spherical.radius * 0.8;
 
-    const newSize = dragStartSize.clone();
-    const newCenter = dragStartCenter.clone();
     const currentSize = dragStartSize.getComponent(selectedAxis);
     const sizeChange = Math.max(MIN_SIZE, currentSize + dragAmount) - currentSize;
+
+    const newSize = dragStartSize.clone();
     newSize.setComponent(selectedAxis, currentSize + sizeChange);
+    const newCenter = dragStartCenter.clone();
     const sign = dragCornerSign.getComponent(selectedAxis);
-    newCenter.setComponent(
-      selectedAxis,
-      dragStartCenter.getComponent(selectedAxis) + sizeChange * sign * 0.5
-    );
+    newCenter.setComponent(selectedAxis,
+      dragStartCenter.getComponent(selectedAxis) + sizeChange * sign * 0.5);
 
     blockSize.copy(newSize);
     blockCenter.copy(newCenter);
@@ -418,31 +484,26 @@ function onMouseMove(e) {
   prevMouse.y = e.clientY;
 
   if (isRotating) {
-    const rotateSpeed = 0.005;
-    spherical.theta -= dx * rotateSpeed;
-    spherical.phi -= dy * rotateSpeed;
+    spherical.theta -= dx * 0.005;
+    spherical.phi -= dy * 0.005;
     spherical.phi = Math.max(0.1, Math.min(Math.PI - 0.1, spherical.phi));
   }
 
   if (isPanning) {
-    const panSpeed = 0.002;
     const right = new THREE.Vector3();
     const up = new THREE.Vector3();
     camera.getWorldDirection(new THREE.Vector3());
     right.setFromMatrixColumn(camera.matrixWorld, 0);
     up.setFromMatrixColumn(camera.matrixWorld, 1);
     const panOffset = new THREE.Vector3();
-    panOffset.addScaledVector(right, -dx * panSpeed * spherical.radius);
-    panOffset.addScaledVector(up, dy * panSpeed * spherical.radius);
+    panOffset.addScaledVector(right, -dx * 0.002 * spherical.radius);
+    panOffset.addScaledVector(up, dy * 0.002 * spherical.radius);
     camTarget.add(panOffset);
   }
 }
 
 function onMouseUp(e) {
-  if (e.button === 0 && isDragging) {
-    isDragging = false;
-    return;
-  }
+  if (e.button === 0 && isDragging) { isDragging = false; return; }
   if (e.button !== 1) return;
   isRotating = false;
   isPanning = false;
@@ -451,22 +512,22 @@ function onMouseUp(e) {
 function onDblClick(e) {
   if (e.button !== 0 || activeVertexIdx < 0 || dimInputActive) return;
   e.preventDefault();
-
   const vd = vertexData[activeVertexIdx];
-  const currentDim = blockSize.getComponent(selectedAxis);
   tempWorldPos.copy(vd.localPos);
   blockMesh.localToWorld(tempWorldPos);
   tempWorldPos.project(camera);
-  const sx = (tempWorldPos.x * 0.5 + 0.5) * window.innerWidth;
-  const sy = (-tempWorldPos.y * 0.5 + 0.5) * window.innerHeight;
-  showDimInput(sx, sy, currentDim, vd.cornerSign);
+  showDimInput(
+    (tempWorldPos.x * 0.5 + 0.5) * window.innerWidth,
+    (-tempWorldPos.y * 0.5 + 0.5) * window.innerHeight,
+    blockSize.getComponent(selectedAxis),
+    vd.cornerSign
+  );
 }
 
 function onWheel(e) {
   e.preventDefault();
-  const zoomSpeed = 1.1;
-  if (e.deltaY > 0) { spherical.radius *= zoomSpeed; }
-  else { spherical.radius /= zoomSpeed; }
+  const z = 1.1;
+  spherical.radius *= e.deltaY > 0 ? z : 1 / z;
   spherical.radius = Math.max(1, Math.min(50, spherical.radius));
 }
 
@@ -484,7 +545,6 @@ renderer.domElement.addEventListener("dblclick", onDblClick);
 renderer.domElement.addEventListener("wheel", onWheel, { passive: false });
 renderer.domElement.addEventListener("contextmenu", onContextMenu);
 
-// --- Resize handling ---
 window.addEventListener("resize", () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
@@ -494,12 +554,9 @@ window.addEventListener("resize", () => {
 // --- Render loop ---
 function animate() {
   requestAnimationFrame(animate);
-
-  const offset = new THREE.Vector3().setFromSpherical(spherical);
-  camera.position.copy(camTarget).add(offset);
+  camera.position.copy(camTarget).add(new THREE.Vector3().setFromSpherical(spherical));
   camera.lookAt(camTarget);
-
-  animateVertices();
+  animateFrame();
   renderer.render(scene, camera);
 }
 
